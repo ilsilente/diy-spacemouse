@@ -1,148 +1,187 @@
-#include <TinyUSB_Mouse_and_Keyboard.h>
-#include <OneButton.h>
-#include <Tlv493d.h>
+#include <Wire.h>
+#include "TLx493D_inc.hpp"
 #include <SimpleKalmanFilter.h>
+#include <OneButton.h>
+#include <Adafruit_TinyUSB.h>
 
-Tlv493d mag = Tlv493d();
-SimpleKalmanFilter xFilter(1, 1, 0.2), yFilter(1, 1, 0.2), zFilter(1, 1, 0.2);
+// USB HID
+Adafruit_USBD_HID usb_hid;
+enum { RID_KEYBOARD=1, RID_MOUSE };
 
-// Setup buttons
-OneButton button1(27, true);
-OneButton button2(24, true);
+// HID descriptor: keyboard + mouse
+uint8_t const desc_hid_report[] = {
+    TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(RID_KEYBOARD)),
+    TUD_HID_REPORT_DESC_MOUSE   (HID_REPORT_ID(RID_MOUSE))
+};
 
-float xOffset = 0, yOffset = 0, zOffset = 0;
-float xCurrent = 0, yCurrent = 0, zCurrent = 0;
+// Magnetometer
+using namespace ifx::tlx493d;
+TLx493D_A1B6 mag(Wire1, TLx493D_IIC_ADDR_A0_e);
 
-int calSamples = 300;
-int sensivity = 8;
-int magRange = 3;
-int outRange = 127;      // Max allowed in HID report
-float xyThreshold = 0.4; // Center threshold
+// Kalman filters
+SimpleKalmanFilter xFilter(1,1,0.2);
+SimpleKalmanFilter yFilter(1,1,0.2);
+SimpleKalmanFilter zFilter(1,1,0.2);
 
-int inRange = magRange * sensivity;
-float zThreshold = xyThreshold * 1.5;
+// Offsets
+float xOffset=0, yOffset=0, zOffset=0;
+float xCurrent=0, yCurrent=0, zCurrent=0;
 
-bool isOrbit = false;
+// Calibration
+int calSamples=50;
+float sensitivity=5; 
+float xyThreshold=0.4;
+float zThreshold = xyThreshold*2.5;
 
-void setup()
-{
+// Buttons
+OneButton button1(27,true); // Left click
+OneButton button2(24,true); // Toggle orbit
 
-  button1.attachClick(goHome);
-  button1.attachLongPressStop(goHome);
+// Keyboard placeholder
+uint8_t key_none[6] = {HID_KEY_NONE};
 
-  button2.attachClick(fitToScreen);
-  button2.attachLongPressStop(fitToScreen);
+// State
+bool middle=false;          // Middle mouse held
+bool orbitModeActive=false; // Toggle orbit mode
 
-  // mouse and keyboard init
-  Mouse.begin();
-  Keyboard.begin();
-
-  Serial.begin(9600);
+// Calibration
+void calibrate() {
+  double x,y,z;
   Wire1.begin();
+  mag.setPowerPin(15,OUTPUT,INPUT,HIGH,LOW,0,250000);
+  mag.begin();
 
-  // mag sensor init
-  mag.begin(Wire1);
-  mag.setAccessMode(mag.MASTERCONTROLLEDMODE);
-  mag.disableTemp();
-
-  // crude offset calibration on first boot
-  for (int i = 1; i <= calSamples; i++)
-  {
-
-    delay(mag.getMeasurementDelay());
-    mag.updateData();
-
-    xOffset += mag.getX();
-    yOffset += mag.getY();
-    zOffset += mag.getZ();
-
-    Serial.print(".");
+  for(int i=0;i<calSamples;i++){
+    mag.getMagneticField(&x,&y,&z);
+    xOffset+=x; yOffset+=y; zOffset+=z;
+    Serial.println("calibrate() -> mag.getMagneticField()");
+    Serial.println(x, DEC);
+    Serial.println(y, DEC);
+    Serial.println(z, DEC);
+    Serial.println();
+    delay(5);
   }
+  xOffset/=calSamples;
+  yOffset/=calSamples;
+  zOffset/=calSamples;
 
-  xOffset = xOffset / calSamples;
-  yOffset = yOffset / calSamples;
-  zOffset = zOffset / calSamples;
+    Serial.println("calibrate() -> Offsets:");
+    Serial.println(xOffset, DEC);
+    Serial.println(yOffset, DEC);
+    Serial.println(zOffset, DEC);
+    Serial.println();
 
-  Serial.println();
-  Serial.println(xOffset);
-  Serial.println(yOffset);
-  Serial.println(zOffset);
 }
 
-void loop()
-{
+// Map magnetometer to HID range
+int mapAxis(float value){
+  int range = 127;
+  return constrain((int)(value*sensitivity), -range, range);
+}
 
-  // keep watching the push buttons
-  button1.tick();
-  button2.tick();
+// Button1: Left mouse click
+void btn1() {
+  usb_hid.mouseButtonPress(RID_MOUSE, MOUSE_BUTTON_LEFT);
+  delay(10);
+  usb_hid.mouseButtonRelease(RID_MOUSE);
+}
 
-  // get the mag data
-  delay(mag.getMeasurementDelay());
-  mag.updateData();
+// Button1 long press: CTRL + SHIFT + H
+void btn1Home() {
+  uint8_t keycode[6] = { HID_KEY_H, 0, 0, 0, 0, 0 };
 
-  // update the filters
-  xCurrent = xFilter.updateEstimate(mag.getX() - xOffset);
-  yCurrent = yFilter.updateEstimate(mag.getY() - yOffset);
-  zCurrent = zFilter.updateEstimate(mag.getZ() - zOffset);
+  usb_hid.keyboardReport(
+    RID_KEYBOARD,
+    KEYBOARD_MODIFIER_LEFTCTRL | KEYBOARD_MODIFIER_LEFTSHIFT,
+    keycode
+  );
 
-  // check the center threshold
-  if (abs(xCurrent) > xyThreshold || abs(yCurrent) > xyThreshold)
-  {
+  delay(20);
 
-    int xMove = 0;
-    int yMove = 0;
+  // Rilascio tasti
+  usb_hid.keyboardRelease(RID_KEYBOARD);
+}
 
-    // map the magnetometer xy to the allowed 127 range in HID repports
-    xMove = map(xCurrent, -inRange, inRange, -outRange, outRange);
-    yMove = map(yCurrent, -inRange, inRange, -outRange, outRange);
+// Button2: Toggle 360 orbit
+void btn2() {
+  orbitModeActive = !orbitModeActive;
 
-    // press shift to orbit in Fusion 360 if the pan threshold is not corssed (zAxis)
-    if (abs(zCurrent) < zThreshold && !isOrbit)
-    {
-      Keyboard.press(KEY_LEFT_SHIFT);
-      isOrbit = true;
+  if (orbitModeActive) {
+    // Start orbit: hold Shift + Middle mouse
+    usb_hid.keyboardReport(RID_KEYBOARD, KEYBOARD_MODIFIER_LEFTSHIFT, key_none);
+    usb_hid.mouseButtonPress(RID_MOUSE, MOUSE_BUTTON_MIDDLE);
+    middle = true;
+  } else {
+    // Stop orbit: release Shift + Middle
+    usb_hid.mouseButtonRelease(RID_MOUSE);
+    usb_hid.keyboardRelease(RID_KEYBOARD);
+    middle = false;
+  }
+}
+
+// Read magnetometer and send HID
+void getMagnet(){
+  double x,y,z;
+  mag.getMagneticField(&x,&y,&z);
+
+  xCurrent=xFilter.updateEstimate(x-xOffset);
+  yCurrent=yFilter.updateEstimate(y-yOffset);
+  zCurrent=zFilter.updateEstimate(z-zOffset);
+
+  int xMove = mapAxis(xCurrent);
+  int yMove = mapAxis(yCurrent);
+
+    Serial.println("getMagnet() -> moves:");
+    Serial.print("xMove: ");  
+    Serial.println(xMove, DEC);  
+    Serial.print("yMove: ");  
+    Serial.println(yMove, DEC);  
+
+  if(orbitModeActive){
+    // 360 orbit mode: Shift + Middle held
+    usb_hid.mouseReport(RID_MOUSE,MOUSE_BUTTON_MIDDLE,xMove,-yMove,0,0);
+  } else {
+    // Regular pan mode: move mouse proportionally
+    usb_hid.mouseReport(RID_MOUSE,0,xMove,-yMove,0,0);
+  }
+}
+
+// Setup
+void setup(){
+    usb_hid.setReportDescriptor(desc_hid_report,sizeof(desc_hid_report));
+    usb_hid.setBootProtocol(HID_ITF_PROTOCOL_NONE);
+    usb_hid.setPollInterval(2);
+    usb_hid.begin();
+
+    if(TinyUSBDevice.mounted()){
+        TinyUSBDevice.detach();
+        delay(10);
+        TinyUSBDevice.attach();
     }
 
-    // pan or orbit by holding the middle mouse button and moving propotionaly to the xy axis
-    Mouse.press(MOUSE_MIDDLE);
-    Mouse.move(yMove, xMove, 0);
-  }
-  else
-  {
+    Serial.begin(115200);
+    while(!Serial);
 
-    // release the mouse and keyboard if within the center threshold
-    Mouse.release(MOUSE_MIDDLE);
-    Keyboard.releaseAll();
-    isOrbit = false;
-  }
+    calibrate();
 
-  Serial.print(xCurrent);
-  Serial.print(",");
-  Serial.print(yCurrent);
-  Serial.print(",");
-  Serial.print(zCurrent);
-  Serial.println();
+    button1.attachClick(btn1);              // short click -> mouse left
+
+    // The default long press for OneButton is 800 ms
+    button1.attachLongPressStart(btn1Home); // long click -> HOME
+
+    button2.attachClick(btn2);              // orbit mode ON/OFF
 }
 
-// go to home view in Fusion 360 by pressing  (CMD + SHIFT + H) shortcut assigned to the custom Add-in command
-void goHome()
-{
-  Keyboard.press(KEY_LEFT_GUI);
-  Keyboard.press(KEY_LEFT_SHIFT);
-  Keyboard.write('h');
+// Loop
+void loop(){
+    button1.tick(); button2.tick();
 
-  delay(10);
-  Keyboard.releaseAll();
-  Serial.println("pressed home");
-}
+#ifdef TINYUSB_NEED_POLLING_TASK
+    TinyUSBDevice.task();
+#endif
 
-// fit to view by pressing the middle mouse button twice
-void fitToScreen()
-{
-  Mouse.press(MOUSE_MIDDLE);
-  Mouse.release(MOUSE_MIDDLE);
-  Mouse.press(MOUSE_MIDDLE);
-  Mouse.release(MOUSE_MIDDLE);
+    if(!TinyUSBDevice.mounted()) return;
 
-  Serial.println("pressed fit");
+    getMagnet();
+    delay(5);
 }
